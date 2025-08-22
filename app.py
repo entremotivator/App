@@ -1,9 +1,9 @@
-# app.py
-# Streamlit demo: Sync all bills + OnePay (single payment split across many bills)
+## bundlpay_app.py
+# Streamlit demo: BundlPay – Sync all bills into one bundle and pay with a single transaction
 # - 50 demo users
 # - 100 different billers
 # - Generate realistic bill portfolios
-# - OnePay engine allocates a single payment by urgency (due soonest) and payoff logic
+# - BundlPay engine allocates a single payment by urgency (due soonest) and payoff logic
 # - In-memory state using st.session_state (portable for Streamlit Cloud)
 # - Download/upload demo data for persistence
 
@@ -135,20 +135,18 @@ def generate_user_bills(user_id: str, billers_df: pd.DataFrame) -> pd.DataFrame:
 
 
 # -----------------------------
-# OnePay Allocation Engine
+# BundlPay Allocation Engine
 # -----------------------------
 
-def allocate_onepay(bills: pd.DataFrame, payment_amount: float) -> pd.DataFrame:
+def allocate_bundlpay(bills: pd.DataFrame, payment_amount: float) -> pd.DataFrame:
     """
-    Allocate a single payment across many bills.
+    Allocate a single payment across many bills (BundlPay logic).
     Priority rules (descending):
       1) Past Due first, then Due Soon, then Upcoming
       2) Sooner due date first
       3) Higher APR next (to reduce interest)
       4) Higher late fee next (to avoid penalties)
       5) Then by min_due coverage and remaining balance
-    Strategy: cover min_due for as many urgent bills as possible, then snowball remainder by APR.
-    Returns a DataFrame of allocations with per-account payment.
     """
     if payment_amount <= 0:
         return pd.DataFrame(columns=["account_id","biller_name","category","due_date","status","apr","late_fee","allocated","covers_min_due","remaining_balance"])
@@ -192,16 +190,14 @@ def allocate_onepay(bills: pd.DataFrame, payment_amount: float) -> pd.DataFrame:
                 "remaining_balance": round(row["balance"] - pay, 2),
             })
 
-    # Step 2: Use leftover to snowball by APR among unpaid/partially paid
+    # Step 2: Snowball remaining by APR
     if remaining > 0:
-        # Merge current allocations to know what's been paid so far
         alloc_df = pd.DataFrame(allocations)
         paid_by_acct = alloc_df.groupby("account_id")["allocated"].sum().to_dict() if not alloc_df.empty else {}
 
         df_snow = df.copy()
         df_snow["paid_so_far"] = df_snow["account_id"].map(paid_by_acct).fillna(0.0)
         df_snow["remaining_after_min"] = (df_snow["balance"] - df_snow["paid_so_far"]).clip(lower=0)
-        # Prefer high APR, then urgency
         df_snow = df_snow[df_snow["remaining_after_min"] > 0].sort_values(
             by=["apr", "status_rank", "due_date", "late_fee", "remaining_after_min"],
             ascending=[False, True, True, False, False]
@@ -213,7 +209,6 @@ def allocate_onepay(bills: pd.DataFrame, payment_amount: float) -> pd.DataFrame:
             pay = min(need, remaining)
             if pay > 0:
                 remaining -= pay
-                # Append or update existing allocation row
                 idx = next((i for i, a in enumerate(allocations) if a["account_id"] == row["account_id"]), None)
                 if idx is None:
                     allocations.append({
@@ -246,25 +241,23 @@ if "all_billers" not in st.session_state:
     st.session_state.all_billers = ALL_BILLERS_DF.copy()
 
 if "user_bills" not in st.session_state:
-    # Dict[user_id] -> DataFrame of bills
     st.session_state.user_bills = {
         uid: generate_user_bills(uid, st.session_state.all_billers)
         for uid in st.session_state.users["user_id"].tolist()
     }
 
 if "transactions" not in st.session_state:
-    st.session_state.transactions = []  # each: {user_id, ts, total_paid, rows: [allocations]}
+    st.session_state.transactions = []
 
 
 # -----------------------------
 # UI Layout
 # -----------------------------
 
-st.set_page_config(page_title="OnePay Bills Demo", page_icon="💳", layout="wide")
+st.set_page_config(page_title="BundlPay – Bundle & Pay All Bills", page_icon="💳", layout="wide")
 
-st.sidebar.title("💳 OnePay Demo")
+st.sidebar.title("💳 BundlPay Demo")
 
-# User select
 user_map = {f"{row.name} ({row.email})": row.user_id for _, row in st.session_state.users.iterrows()}
 user_label = st.sidebar.selectbox("Select demo user", options=list(user_map.keys()))
 user_id = user_map[user_label]
@@ -275,150 +268,60 @@ st.sidebar.markdown(f"**Name:** {user_row['name']}")
 st.sidebar.markdown(f"**Credit Score:** {int(user_row['credit_score'])}")
 st.sidebar.markdown(f"**Annual Income:** ${user_row['annual_income']:,}")
 
-# Payment input
 bills_df = st.session_state.user_bills[user_id].copy()
 
 total_balance = float(bills_df["balance"].sum())
 min_due_total = float(bills_df["min_due"].sum())
 past_due_total = float(bills_df.loc[bills_df["status"] == "Past Due", "balance"].sum())
 
-def money(x):
-    return f"${x:,.2f}"
+st.title("BundlPay – Sync & Pay All Bills in One")
 
-# Header
-st.title("Sync & Pay All Bills with One Payment")
 col_a, col_b, col_c, col_d = st.columns(4)
-col_a.metric("Total Balance", money(total_balance))
-col_b.metric("Total Min Due", money(min_due_total))
-col_c.metric("Past Due", money(past_due_total))
+col_a.metric("Total Balance", f"${total_balance:,.2f}")
+col_b.metric("Total Min Due", f"${min_due_total:,.2f}")
+col_c.metric("Total Past Due", f"${past_due_total:,.2f}")
 col_d.metric("Bills Linked", f"{len(bills_df)}")
 
 with st.expander("Linked Billers (100 catalog)"):
     st.dataframe(st.session_state.all_billers)
 
-# Filters
-with st.container():
-    f1, f2, f3, f4 = st.columns(4)
-    status_filter = f1.multiselect("Status", ["Past Due","Due Soon","Upcoming"], default=["Past Due","Due Soon","Upcoming"])
-    cat_filter = f2.multiselect("Category", sorted(bills_df["category"].unique()), default=list(sorted(bills_df["category"].unique())))
-    autopay_filter = f3.selectbox("Autopay", ["All","On","Off"], index=0)
-    sort_by = f4.selectbox("Sort By", ["due_date","status","category","apr","balance","min_due"], index=0)
-
-    df_view = bills_df.copy()
-    df_view = df_view[df_view["status"].isin(status_filter) & df_view["category"].isin(cat_filter)]
-    if autopay_filter != "All":
-        df_view = df_view[df_view["autopay"] == (autopay_filter == "On")]
-    df_view = df_view.sort_values(sort_by)
-
 st.subheader("Linked Bills")
-st.dataframe(df_view)
+st.dataframe(bills_df)
 
-# OnePay input & preview
-st.subheader("OnePay: Split a Single Payment Across All Bills")
+st.subheader("BundlPay: One Payment, Smartly Allocated")
 default_pay = min(round(min_due_total * 1.2, 2), round(total_balance, 2))
-payment_amount = st.number_input("Payment amount (USD)", min_value=0.0, value=float(default_pay), step=10.0, help="We'll smartly allocate this across your bills.")
+payment_amount = st.number_input("Payment amount (USD)", min_value=0.0, value=float(default_pay), step=10.0)
 
-alloc_preview = allocate_onepay(bills_df, payment_amount)
+alloc_preview = allocate_bundlpay(bills_df, payment_amount)
 
-col1, col2 = st.columns([2,1])
-with col1:
-    st.markdown("**Proposed Allocation** (based on urgency, due date, APR, fees)")
-    if alloc_preview.empty:
-        st.info("Enter a positive payment amount to see the allocation plan.")
-    else:
-        st.dataframe(alloc_preview)
+st.subheader("Proposed Allocation")
+if alloc_preview.empty:
+    st.info("Enter a positive payment amount to see the BundlPay allocation plan.")
+else:
+    st.dataframe(alloc_preview)
 
-with col2:
-    covered = int(alloc_preview["covers_min_due"].sum()) if not alloc_preview.empty else 0
-    st.metric("Bills with Min Due Covered", f"{covered}")
-    st.metric("Accounts Receiving Payment", f"{len(alloc_preview)}")
-    st.metric("Unallocated Remainder", money(round(max(0.0, payment_amount - float(alloc_preview["allocated"].sum() if not alloc_preview.empty else 0.0)), 2)))
+covered = int(alloc_preview["covers_min_due"].sum()) if not alloc_preview.empty else 0
+st.metric("Bills with Min Due Covered", f"{covered}")
+st.metric("Accounts Receiving Payment", f"{len(alloc_preview)}")
+st.metric("Unallocated Remainder", f"${round(max(0.0, payment_amount - float(alloc_preview['allocated'].sum() if not alloc_preview.empty else 0.0)), 2):,.2f}")
 
-# Confirm button
-confirm = st.button("✅ Confirm OnePay")
+confirm = st.button("✅ Confirm BundlPay")
 if confirm:
     if payment_amount <= 0 or alloc_preview.empty:
         st.warning("Enter a positive payment and ensure there are balances to pay.")
     else:
-        # Apply allocation to balances
         new_bills = bills_df.set_index("account_id").copy()
         for _, r in alloc_preview.iterrows():
             acct = r["account_id"]
             paid = float(r["allocated"])
             new_bills.loc[acct, "balance"] = round(max(0.0, float(new_bills.loc[acct, "balance"]) - paid), 2)
-            # If fully covered min due, push due date forward ~30 days (simulate next cycle)
             if r["covers_min_due"]:
                 new_bills.loc[acct, "due_date"] = new_bills.loc[acct, "due_date"] + timedelta(days=30)
-
-        # Recompute status
         new_bills = new_bills.reset_index()
         new_bills["status"] = new_bills["due_date"].apply(lambda d: "Past Due" if d < TODAY else ("Due Soon" if (d - TODAY).days <= 7 else "Upcoming"))
-
         st.session_state.user_bills[user_id] = new_bills
         st.session_state.transactions.append({
             "user_id": user_id,
             "ts": datetime.now().isoformat(timespec='seconds'),
             "total_paid": round(float(alloc_preview["allocated"].sum()), 2),
-            "rows": alloc_preview.to_dict(orient="records"),
-        })
-        st.success(f"OnePay completed: {money(float(alloc_preview['allocated'].sum()))} across {len(alloc_preview)} accounts.")
-        st.experimental_rerun()
-
-# Transactions history
-st.subheader("Payment History")
-hist = [t for t in st.session_state.transactions if t["user_id"] == user_id]
-if not hist:
-    st.info("No payments yet for this user.")
-else:
-    # Flatten for display
-    flat = []
-    for t in hist:
-        for r in t["rows"]:
-            flat.append({
-                "timestamp": t["ts"],
-                "user_id": user_id,
-                **{k: r[k] for k in ["account_id","biller_name","category","allocated"]},
-                "total_paid": t["total_paid"],
-            })
-    st.dataframe(pd.DataFrame(flat).sort_values("timestamp", ascending=False))
-
-# Data management
-st.subheader("Data Management")
-colx, coly, colz = st.columns(3)
-with colx:
-    if st.button("🔄 Re-generate demo data (all users)"):
-        st.session_state.users = generate_demo_users(50)
-        st.session_state.user_bills = {
-            uid: generate_user_bills(uid, st.session_state.all_billers)
-            for uid in st.session_state.users["user_id"].tolist()
-        }
-        st.session_state.transactions = []
-        st.success("Demo data regenerated.")
-        st.experimental_rerun()
-
-with coly:
-    # Export current selected user's bills
-    csv = st.session_state.user_bills[user_id].to_csv(index=False).encode()
-    st.download_button("⬇️ Download current user's bills (CSV)", data=csv, file_name=f"{user_id}_bills.csv", mime="text/csv")
-
-with colz:
-    uploaded = st.file_uploader("Upload bills CSV for this user (same columns)")
-    if uploaded is not None:
-        try:
-            df_up = pd.read_csv(uploaded, parse_dates=["due_date"]).copy()
-            # Ensure types
-            needed_cols = {"user_id","account_id","biller_id","biller_name","category","due_date","status","balance","min_due","apr","late_fee","autopay"}
-            missing = needed_cols - set(df_up.columns)
-            if missing:
-                st.error(f"Missing columns: {missing}")
-            else:
-                # Coerce date to date
-                df_up["due_date"] = pd.to_datetime(df_up["due_date"]).dt.date
-                st.session_state.user_bills[user_id] = df_up
-                st.success("Bills uploaded and replaced for this user.")
-                st.experimental_rerun()
-        except Exception as e:
-            st.error(f"Upload failed: {e}")
-
-# Footer
-st.caption("Demo app for showcasing a one-payment bill allocation flow with 50 demo users and 100 billers. Not connected to real payment rails.")
+            "rows": alloc_preview.to_dict(orient="records
